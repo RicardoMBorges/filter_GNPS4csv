@@ -5,6 +5,7 @@
 # - Auto-detect delimiter and SMILES column
 # - Stream-filter MGF blocks (memory-friendly)
 # - Download filtered MGF
+# - Plot SMILES as an RDKit structure grid (with compound_name if present)
 
 from __future__ import annotations
 
@@ -15,8 +16,6 @@ from typing import Iterable, Optional, Tuple, List, Set
 
 import pandas as pd
 import streamlit as st
-
-# Add these imports near the top with the others
 from PIL import Image
 
 try:
@@ -26,6 +25,7 @@ try:
 except Exception:
     RDKit_AVAILABLE = False
 
+
 # -----------------------------
 # Utilities
 # -----------------------------
@@ -34,9 +34,7 @@ COMMON_DELIMS = [",", "\t", ";", "|"]
 
 
 def sniff_delimiter(file_bytes: bytes, default: str = ",") -> str:
-    """
-    Try to detect CSV delimiter. Falls back to default if sniffing fails.
-    """
+    """Try to detect CSV delimiter. Falls back to default if sniffing fails."""
     sample = file_bytes[:8192].decode("utf-8", errors="ignore")
     if not sample.strip():
         return default
@@ -55,9 +53,7 @@ def sniff_delimiter(file_bytes: bytes, default: str = ",") -> str:
 
 
 def detect_smiles_column(columns: Iterable[str]) -> Optional[str]:
-    """
-    Heuristic SMILES column detection.
-    """
+    """Heuristic SMILES column detection."""
     cols = list(columns)
     lower_map = {c.lower().strip(): c for c in cols}
 
@@ -68,11 +64,37 @@ def detect_smiles_column(columns: Iterable[str]) -> Optional[str]:
 
     # broader contains
     for c in cols:
-        cl = c.lower()
-        if "smiles" in cl:
+        if "smiles" in c.lower():
             return c
 
     return None
+
+
+def detect_compound_name_column(columns: Iterable[str]) -> Optional[str]:
+    """Heuristic compound name column detection."""
+    cols = list(columns)
+    lower_map = {c.lower().strip(): c for c in cols}
+
+    # strong matches
+    for key in ("compound_name", "compoundname", "name", "compound"):
+        if key in lower_map:
+            return lower_map[key]
+
+    # broader contains
+    for c in cols:
+        cl = c.lower()
+        if "compound" in cl and "name" in cl:
+            return c
+
+    return None
+
+
+def load_table_df(table_bytes: bytes) -> Tuple[pd.DataFrame, str]:
+    """Load the full table as a dataframe, returning (df, detected_sep)."""
+    sep = sniff_delimiter(table_bytes, default=",")
+    buf = io.BytesIO(table_bytes)
+    df = pd.read_csv(buf, sep=sep, engine="python")
+    return df, sep
 
 
 def load_smiles_set(table_bytes: bytes) -> Tuple[Set[str], str, str]:
@@ -82,23 +104,14 @@ def load_smiles_set(table_bytes: bytes) -> Tuple[Set[str], str, str]:
       - detected delimiter
       - detected column name used
     """
-    sep = sniff_delimiter(table_bytes, default=",")
-    buf = io.BytesIO(table_bytes)
-
-    # pandas can handle mixed quoting better with python engine in some cases
-    df = pd.read_csv(buf, sep=sep, engine="python")
+    df, sep = load_table_df(table_bytes)
     smiles_col = detect_smiles_column(df.columns)
     if not smiles_col:
         raise ValueError(
             "No SMILES column found. Expected a column named like: SMILES, compound_smiles, structure_smiles."
         )
 
-    smiles = (
-        df[smiles_col]
-        .dropna()
-        .astype(str)
-        .map(lambda s: s.strip())
-    )
+    smiles = df[smiles_col].dropna().astype(str).map(lambda s: s.strip())
     smiles_set = {s for s in smiles if s}
 
     if not smiles_set:
@@ -106,6 +119,10 @@ def load_smiles_set(table_bytes: bytes) -> Tuple[Set[str], str, str]:
 
     return smiles_set, sep, smiles_col
 
+
+# -----------------------------
+# Filtering core
+# -----------------------------
 
 @dataclass
 class FilterReport:
@@ -121,7 +138,7 @@ def iter_filtered_mgf_bytes(
     smiles_allowed: Set[str],
 ) -> Tuple[bytes, FilterReport, Set[str]]:
     """
-    Stream-parse an MGF and return the filtered MGF bytes + report.
+    Stream-parse an MGF and return the filtered MGF bytes + report + matched_smiles_set.
     This avoids storing all blocks in memory.
 
     Rules:
@@ -140,14 +157,15 @@ def iter_filtered_mgf_bytes(
 
     for raw in mgf_text_stream:
         line = raw.rstrip("\n")
+        stripped = line.strip()
 
-        if line.strip() == "BEGIN IONS":
+        if stripped == "BEGIN IONS":
             in_block = True
             current_lines = [line + "\n"]
             current_smiles = None
             continue
 
-        if line.strip() == "END IONS" and in_block:
+        if stripped == "END IONS" and in_block:
             current_lines.append(line + "\n")
             total += 1
 
@@ -156,7 +174,6 @@ def iter_filtered_mgf_bytes(
 
             if current_smiles and current_smiles in smiles_allowed:
                 out.writelines(current_lines)
-                # ensure a trailing newline between blocks (MGF tolerant)
                 if not current_lines[-1].endswith("\n"):
                     out.write("\n")
                 matched += 1
@@ -169,7 +186,6 @@ def iter_filtered_mgf_bytes(
 
         if in_block:
             current_lines.append(line + "\n")
-            stripped = line.strip()
             if current_smiles is None and stripped.startswith("SMILES="):
                 current_smiles = stripped.split("=", 1)[1].strip()
 
@@ -181,34 +197,8 @@ def iter_filtered_mgf_bytes(
         unique_smiles_matched=len(matched_smiles_set),
     )
 
-    return out.getvalue().encode("utf-8"), report
-
-    def detect_compound_name_column(columns: Iterable[str]) -> Optional[str]:
-    cols = list(columns)
-    lower_map = {c.lower().strip(): c for c in cols}
-
-    # strong matches
-    for key in ("compound_name", "name", "compound", "compoundname"):
-        if key in lower_map:
-            return lower_map[key]
-
-    # broader contains
-    for c in cols:
-        cl = c.lower()
-        if "compound" in cl and "name" in cl:
-            return c
-
     return out.getvalue().encode("utf-8"), report, matched_smiles_set
 
-
-def load_table_df(table_bytes: bytes) -> Tuple[pd.DataFrame, str]:
-    """
-    Load the full table as a dataframe, returning (df, detected_sep).
-    """
-    sep = sniff_delimiter(table_bytes, default=",")
-    buf = io.BytesIO(table_bytes)
-    df = pd.read_csv(buf, sep=sep, engine="python")
-    return df, sep
 
 # -----------------------------
 # Streamlit UI
@@ -221,7 +211,7 @@ st.markdown(
     """
 Upload:
 1) An **MGF** file containing blocks with `BEGIN IONS ... END IONS` and (ideally) a `SMILES=` line inside each block.
-2) A **CSV/TSV** table containing a **SMILES** column.
+2) A **CSV/TSV** table containing a **SMILES** column (optionally `compound_name`).
 
 The app will keep only spectra whose `SMILES=` exactly matches one of the SMILES in your table.
 """
@@ -230,13 +220,15 @@ The app will keep only spectra whose `SMILES=` exactly matches one of the SMILES
 with st.sidebar:
     st.header("Inputs")
     mgf_file = st.file_uploader("Upload MGF", type=["mgf", "txt"], accept_multiple_files=False)
-    table_file = st.file_uploader("Upload table (CSV/TSV) with SMILES column", type=["csv", "tsv", "txt"], accept_multiple_files=False)
+    table_file = st.file_uploader(
+        "Upload table (CSV/TSV) with SMILES column",
+        type=["csv", "tsv", "txt"],
+        accept_multiple_files=False,
+    )
 
     st.divider()
     st.header("Options")
-    strict_match = st.checkbox("Strict SMILES match (exact string)", value=True, disabled=True)
-    st.caption("Currently uses exact string matching for safety and reproducibility.")
-
+    st.checkbox("Strict SMILES match (exact string)", value=True, disabled=True)
     run_btn = st.button("Run filtering", type="primary", use_container_width=True)
 
 if not mgf_file or not table_file:
@@ -254,14 +246,15 @@ except Exception as e:
     st.error(f"Failed to read the table: {e}")
     st.stop()
 
-st.success(f"Loaded {len(smiles_allowed):,} unique SMILES from column **{smiles_col}** (delimiter detected: `{repr(detected_sep)}`).")
+st.success(
+    f"Loaded {len(smiles_allowed):,} unique SMILES from column **{smiles_col}** "
+    f"(delimiter detected: `{repr(detected_sep)}`)."
+)
 
 # Stream-filter MGF
 mgf_bytes = mgf_file.getvalue()
 
-# Large files: show a progress-ish spinner
 with st.spinner("Filtering MGF blocks (streaming)..."):
-    # decode as text stream for line iteration
     text_stream = io.StringIO(mgf_bytes.decode("utf-8", errors="ignore"))
     filtered_bytes, report, matched_smiles_set = iter_filtered_mgf_bytes(text_stream, smiles_allowed)
 
@@ -306,10 +299,14 @@ with st.expander("Preview filtered MGF (first 200 lines)"):
     preview = filtered_bytes.decode("utf-8", errors="ignore").splitlines()[:200]
     st.code("\n".join(preview) if preview else "(empty)", language="text")
 
-# Optional: show a small sample of the SMILES list
 with st.expander("Preview SMILES loaded from table (first 50)"):
-    smi_preview = sorted(list(smiles_allowed))[:50]
+    smi_preview = sorted(smiles_allowed)[:50]
+    st.code("\n".join(smi_preview), language="text")
 
+
+# -----------------------------
+# RDKit grid
+# -----------------------------
 
 st.divider()
 st.subheader("SMILES structure matrix (RDKit)")
@@ -320,17 +317,15 @@ if not RDKit_AVAILABLE:
         "Install it (e.g., conda install -c conda-forge rdkit) to enable structure plotting."
     )
 else:
-    # Load full table to retrieve compound_name (optional) and SMILES mapping
     try:
         df_table, _sep2 = load_table_df(table_bytes)
         smiles_col2 = detect_smiles_column(df_table.columns)
         if not smiles_col2:
-            st.warning("Could not re-detect SMILES column for structure plotting.")
+            st.warning("Could not detect a SMILES column for structure plotting.")
             st.stop()
 
         name_col = detect_compound_name_column(df_table.columns)  # may be None
 
-        # Option: plot only matched SMILES
         only_matched = st.checkbox("Plot only SMILES that matched spectra in the filtered MGF", value=True)
         max_mols = st.slider("Max molecules to display", min_value=12, max_value=240, value=60, step=12)
         mols_per_row = st.slider("Molecules per row", min_value=3, max_value=10, value=5, step=1)
@@ -341,13 +336,8 @@ else:
         if only_matched:
             df_plot = df_plot[df_plot[smiles_col2].isin(matched_smiles_set)]
 
-        # Drop empty/invalid-ish smiles strings
         df_plot = df_plot[df_plot[smiles_col2].astype(bool)]
-
-        # Keep first occurrence per SMILES (optional, avoids duplicates)
         df_plot = df_plot.drop_duplicates(subset=[smiles_col2], keep="first")
-
-        # Limit
         df_plot = df_plot.head(max_mols)
 
         if df_plot.empty:
@@ -357,15 +347,17 @@ else:
 
             if name_col and name_col in df_plot.columns:
                 legends = df_plot[name_col].fillna("").astype(str).tolist()
-                # fallback to SMILES if name empty
                 legends = [leg.strip() if leg.strip() else smi for leg, smi in zip(legends, smiles_list)]
             else:
                 legends = smiles_list
 
-            # Build RDKit mols (skip invalid)
-            mols = []
-            mol_legends = [s[:30] + "…" if len(s) > 31 else s for s in mol_legends]
+            # truncate legends a bit (keeps the grid readable)
+            legends = [s[:30] + "…" if len(s) > 31 else s for s in legends]
+
+            mols: List = []
+            mol_legends: List[str] = []
             invalid = 0
+
             for smi, leg in zip(smiles_list, legends):
                 m = Chem.MolFromSmiles(smi)
                 if m is None:
@@ -380,7 +372,6 @@ else:
                 if invalid > 0:
                     st.info(f"Skipped {invalid} invalid SMILES (RDKit could not parse).")
 
-                # Draw grid
                 img = Draw.MolsToGridImage(
                     mols,
                     molsPerRow=mols_per_row,
@@ -389,17 +380,14 @@ else:
                     useSVG=False,
                 )
 
-                # RDKit returns PIL Image here (useSVG=False)
                 if isinstance(img, Image.Image):
                     st.image(img, caption="Structure grid (SMILES → 2D RDKit depiction)", use_container_width=True)
                 else:
-                    # fallback if RDKit returns something else
                     st.write(img)
 
             with st.expander("Table used for plotting (preview)"):
                 show_cols = [c for c in [name_col, smiles_col2] if c]
                 st.dataframe(df_plot[show_cols].head(50))
+
     except Exception as e:
         st.error(f"Failed to plot structures: {e}")
-
-    st.code("\n".join(smi_preview), language="text")
