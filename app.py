@@ -25,6 +25,8 @@ try:
 except Exception:
     RDKit_AVAILABLE = False
 
+import urllib.parse
+import urllib.request
 
 # -----------------------------
 # Utilities
@@ -119,6 +121,77 @@ def load_smiles_set(table_bytes: bytes) -> Tuple[Set[str], str, str]:
 
     return smiles_set, sep, smiles_col
 
+@st.cache_data(show_spinner=False)
+def fetch_structure_png_from_smiles(smiles: str, size: int = 300) -> Optional[bytes]:
+    """
+    Fetch a structure PNG from the CACTUS Structure Resolver.
+    Returns PNG bytes or None if it fails.
+
+    NOTE: Requires internet access from the Streamlit environment.
+    """
+    smi = smiles.strip()
+    if not smi:
+        return None
+
+    # CACTUS resolver expects URL-encoded SMILES in the path
+    encoded = urllib.parse.quote(smi, safe="")
+    url = f"https://cactus.nci.nih.gov/chemical/structure/{encoded}/image?format=png&width={size}&height={size}"
+
+    try:
+        req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+        with urllib.request.urlopen(req, timeout=20) as resp:
+            return resp.read()
+    except Exception:
+        return None
+
+
+def render_structure_grid_no_rdkit(
+    df_plot: pd.DataFrame,
+    smiles_col: str,
+    name_col: Optional[str],
+    mols_per_row: int = 5,
+    size: int = 260,
+    max_mols: int = 60,
+) -> None:
+    """
+    Render a grid of structure images resolved online from SMILES.
+    """
+    df_plot = df_plot.copy()
+    df_plot[smiles_col] = df_plot[smiles_col].astype(str).map(lambda s: s.strip())
+    df_plot = df_plot[df_plot[smiles_col].astype(bool)].drop_duplicates(subset=[smiles_col]).head(max_mols)
+
+    if df_plot.empty:
+        st.info("No SMILES available to plot.")
+        return
+
+    smiles_list = df_plot[smiles_col].tolist()
+
+    if name_col and name_col in df_plot.columns:
+        labels = df_plot[name_col].fillna("").astype(str).tolist()
+        labels = [lab.strip() if lab.strip() else smi for lab, smi in zip(labels, smiles_list)]
+    else:
+        labels = smiles_list
+
+    failed = 0
+    for i in range(0, len(smiles_list), mols_per_row):
+        row_smiles = smiles_list[i : i + mols_per_row]
+        row_labels = labels[i : i + mols_per_row]
+        cols = st.columns(mols_per_row)
+
+        for j, (smi, lab) in enumerate(zip(row_smiles, row_labels)):
+            png = fetch_structure_png_from_smiles(smi, size=size)
+            with cols[j]:
+                if png is None:
+                    failed += 1
+                    st.write("❌")
+                    st.caption(lab[:60] + ("…" if len(lab) > 60 else ""))
+                    st.caption("Image unavailable")
+                else:
+                    st.image(png, use_container_width=True)
+                    st.caption(lab[:60] + ("…" if len(lab) > 60 else ""))
+
+    if failed:
+        st.info(f"{failed} structure images could not be fetched (resolver failed or SMILES invalid).")
 
 # -----------------------------
 # Filtering core
@@ -310,90 +383,45 @@ with st.expander("Preview SMILES loaded from table (first 50)"):
 
 
 # -----------------------------
-# RDKit grid
+# SMILES Structure Matrix
 # -----------------------------
-
 st.divider()
-st.subheader("SMILES structure matrix (RDKit)")
+st.subheader("SMILES structure matrix")
 
-if not RDKit_AVAILABLE:
-    st.warning(
-        "RDKit is not available in this environment. "
-        "Install it (e.g., conda install -c conda-forge rdkit) to enable structure plotting."
+st.caption("Uses an online structure resolver (CACTUS). Requires internet access from where Streamlit is running.")
+
+try:
+    df_table, _sep2 = load_table_df(table_bytes)
+    smiles_col2 = detect_smiles_column(df_table.columns)
+    if not smiles_col2:
+        st.warning("Could not detect a SMILES column for structure plotting.")
+        st.stop()
+
+    name_col = detect_compound_name_column(df_table.columns)  # may be None
+
+    only_matched = st.checkbox("Plot only SMILES that matched spectra in the filtered MGF", value=True)
+    max_mols = st.slider("Max molecules to display", min_value=12, max_value=240, value=60, step=12)
+    mols_per_row = st.slider("Molecules per row", min_value=3, max_value=10, value=5, step=1)
+    img_size = st.slider("Image size (px)", min_value=150, max_value=500, value=260, step=10)
+
+    df_plot = df_table.copy()
+    df_plot[smiles_col2] = df_plot[smiles_col2].astype(str).map(lambda s: s.strip())
+
+    if only_matched:
+        df_plot = df_plot[df_plot[smiles_col2].isin(matched_smiles_set)]
+
+    render_structure_grid_no_rdkit(
+        df_plot=df_plot,
+        smiles_col=smiles_col2,
+        name_col=name_col,
+        mols_per_row=mols_per_row,
+        size=img_size,
+        max_mols=max_mols,
     )
-else:
-    try:
-        df_table, _sep2 = load_table_df(table_bytes)
-        smiles_col2 = detect_smiles_column(df_table.columns)
-        if not smiles_col2:
-            st.warning("Could not detect a SMILES column for structure plotting.")
-            st.stop()
 
-        name_col = detect_compound_name_column(df_table.columns)  # may be None
+    with st.expander("Table used for plotting (preview)"):
+        show_cols = [c for c in [name_col, smiles_col2] if c]
+        st.dataframe(df_plot[show_cols].head(50))
 
-        only_matched = st.checkbox("Plot only SMILES that matched spectra in the filtered MGF", value=True)
-        max_mols = st.slider("Max molecules to display", min_value=12, max_value=240, value=60, step=12)
-        mols_per_row = st.slider("Molecules per row", min_value=3, max_value=10, value=5, step=1)
-
-        df_plot = df_table.copy()
-        df_plot[smiles_col2] = df_plot[smiles_col2].astype(str).map(lambda s: s.strip())
-
-        if only_matched:
-            df_plot = df_plot[df_plot[smiles_col2].isin(matched_smiles_set)]
-
-        df_plot = df_plot[df_plot[smiles_col2].astype(bool)]
-        df_plot = df_plot.drop_duplicates(subset=[smiles_col2], keep="first")
-        df_plot = df_plot.head(max_mols)
-
-        if df_plot.empty:
-            st.info("No SMILES available to plot under the current selection.")
-        else:
-            smiles_list = df_plot[smiles_col2].tolist()
-
-            if name_col and name_col in df_plot.columns:
-                legends = df_plot[name_col].fillna("").astype(str).tolist()
-                legends = [leg.strip() if leg.strip() else smi for leg, smi in zip(legends, smiles_list)]
-            else:
-                legends = smiles_list
-
-            # truncate legends a bit (keeps the grid readable)
-            legends = [s[:30] + "…" if len(s) > 31 else s for s in legends]
-
-            mols: List = []
-            mol_legends: List[str] = []
-            invalid = 0
-
-            for smi, leg in zip(smiles_list, legends):
-                m = Chem.MolFromSmiles(smi)
-                if m is None:
-                    invalid += 1
-                    continue
-                mols.append(m)
-                mol_legends.append(leg)
-
-            if not mols:
-                st.warning("All SMILES in the selected set failed RDKit parsing.")
-            else:
-                if invalid > 0:
-                    st.info(f"Skipped {invalid} invalid SMILES (RDKit could not parse).")
-
-                img = Draw.MolsToGridImage(
-                    mols,
-                    molsPerRow=mols_per_row,
-                    subImgSize=(260, 220),
-                    legends=mol_legends,
-                    useSVG=False,
-                )
-
-                if isinstance(img, Image.Image):
-                    st.image(img, caption="Structure grid (SMILES → 2D RDKit depiction)", use_container_width=True)
-                else:
-                    st.write(img)
-
-            with st.expander("Table used for plotting (preview)"):
-                show_cols = [c for c in [name_col, smiles_col2] if c]
-                st.dataframe(df_plot[show_cols].head(50))
-
-    except Exception as e:
-        st.error(f"Failed to plot structures: {e}")
-
+except Exception as e:
+    st.error(f"Failed to plot structures: {e}")
