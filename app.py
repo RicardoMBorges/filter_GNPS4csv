@@ -16,6 +16,15 @@ from typing import Iterable, Optional, Tuple, List, Set
 import pandas as pd
 import streamlit as st
 
+# Add these imports near the top with the others
+from PIL import Image
+
+try:
+    from rdkit import Chem
+    from rdkit.Chem import Draw
+    RDKit_AVAILABLE = True
+except Exception:
+    RDKit_AVAILABLE = False
 
 # -----------------------------
 # Utilities
@@ -110,7 +119,7 @@ class FilterReport:
 def iter_filtered_mgf_bytes(
     mgf_text_stream: io.TextIOBase,
     smiles_allowed: Set[str],
-) -> Tuple[bytes, FilterReport]:
+) -> Tuple[bytes, FilterReport, Set[str]]:
     """
     Stream-parse an MGF and return the filtered MGF bytes + report.
     This avoids storing all blocks in memory.
@@ -174,6 +183,32 @@ def iter_filtered_mgf_bytes(
 
     return out.getvalue().encode("utf-8"), report
 
+    def detect_compound_name_column(columns: Iterable[str]) -> Optional[str]:
+    cols = list(columns)
+    lower_map = {c.lower().strip(): c for c in cols}
+
+    # strong matches
+    for key in ("compound_name", "name", "compound", "compoundname"):
+        if key in lower_map:
+            return lower_map[key]
+
+    # broader contains
+    for c in cols:
+        cl = c.lower()
+        if "compound" in cl and "name" in cl:
+            return c
+
+    return out.getvalue().encode("utf-8"), report, matched_smiles_set
+
+
+def load_table_df(table_bytes: bytes) -> Tuple[pd.DataFrame, str]:
+    """
+    Load the full table as a dataframe, returning (df, detected_sep).
+    """
+    sep = sniff_delimiter(table_bytes, default=",")
+    buf = io.BytesIO(table_bytes)
+    df = pd.read_csv(buf, sep=sep, engine="python")
+    return df, sep
 
 # -----------------------------
 # Streamlit UI
@@ -228,7 +263,7 @@ mgf_bytes = mgf_file.getvalue()
 with st.spinner("Filtering MGF blocks (streaming)..."):
     # decode as text stream for line iteration
     text_stream = io.StringIO(mgf_bytes.decode("utf-8", errors="ignore"))
-    filtered_bytes, report = iter_filtered_mgf_bytes(text_stream, smiles_allowed)
+    filtered_bytes, report, matched_smiles_set = iter_filtered_mgf_bytes(text_stream, smiles_allowed)
 
 # Results
 col1, col2, col3, col4, col5 = st.columns(5)
@@ -274,4 +309,97 @@ with st.expander("Preview filtered MGF (first 200 lines)"):
 # Optional: show a small sample of the SMILES list
 with st.expander("Preview SMILES loaded from table (first 50)"):
     smi_preview = sorted(list(smiles_allowed))[:50]
+
+
+st.divider()
+st.subheader("SMILES structure matrix (RDKit)")
+
+if not RDKit_AVAILABLE:
+    st.warning(
+        "RDKit is not available in this environment. "
+        "Install it (e.g., conda install -c conda-forge rdkit) to enable structure plotting."
+    )
+else:
+    # Load full table to retrieve compound_name (optional) and SMILES mapping
+    try:
+        df_table, _sep2 = load_table_df(table_bytes)
+        smiles_col2 = detect_smiles_column(df_table.columns)
+        if not smiles_col2:
+            st.warning("Could not re-detect SMILES column for structure plotting.")
+            st.stop()
+
+        name_col = detect_compound_name_column(df_table.columns)  # may be None
+
+        # Option: plot only matched SMILES
+        only_matched = st.checkbox("Plot only SMILES that matched spectra in the filtered MGF", value=True)
+        max_mols = st.slider("Max molecules to display", min_value=12, max_value=240, value=60, step=12)
+        mols_per_row = st.slider("Molecules per row", min_value=3, max_value=10, value=5, step=1)
+
+        df_plot = df_table.copy()
+        df_plot[smiles_col2] = df_plot[smiles_col2].astype(str).map(lambda s: s.strip())
+
+        if only_matched:
+            df_plot = df_plot[df_plot[smiles_col2].isin(matched_smiles_set)]
+
+        # Drop empty/invalid-ish smiles strings
+        df_plot = df_plot[df_plot[smiles_col2].astype(bool)]
+
+        # Keep first occurrence per SMILES (optional, avoids duplicates)
+        df_plot = df_plot.drop_duplicates(subset=[smiles_col2], keep="first")
+
+        # Limit
+        df_plot = df_plot.head(max_mols)
+
+        if df_plot.empty:
+            st.info("No SMILES available to plot under the current selection.")
+        else:
+            smiles_list = df_plot[smiles_col2].tolist()
+
+            if name_col and name_col in df_plot.columns:
+                legends = df_plot[name_col].fillna("").astype(str).tolist()
+                # fallback to SMILES if name empty
+                legends = [leg.strip() if leg.strip() else smi for leg, smi in zip(legends, smiles_list)]
+            else:
+                legends = smiles_list
+
+            # Build RDKit mols (skip invalid)
+            mols = []
+            mol_legends = [s[:30] + "…" if len(s) > 31 else s for s in mol_legends]
+            invalid = 0
+            for smi, leg in zip(smiles_list, legends):
+                m = Chem.MolFromSmiles(smi)
+                if m is None:
+                    invalid += 1
+                    continue
+                mols.append(m)
+                mol_legends.append(leg)
+
+            if not mols:
+                st.warning("All SMILES in the selected set failed RDKit parsing.")
+            else:
+                if invalid > 0:
+                    st.info(f"Skipped {invalid} invalid SMILES (RDKit could not parse).")
+
+                # Draw grid
+                img = Draw.MolsToGridImage(
+                    mols,
+                    molsPerRow=mols_per_row,
+                    subImgSize=(260, 220),
+                    legends=mol_legends,
+                    useSVG=False,
+                )
+
+                # RDKit returns PIL Image here (useSVG=False)
+                if isinstance(img, Image.Image):
+                    st.image(img, caption="Structure grid (SMILES → 2D RDKit depiction)", use_container_width=True)
+                else:
+                    # fallback if RDKit returns something else
+                    st.write(img)
+
+            with st.expander("Table used for plotting (preview)"):
+                show_cols = [c for c in [name_col, smiles_col2] if c]
+                st.dataframe(df_plot[show_cols].head(50))
+    except Exception as e:
+        st.error(f"Failed to plot structures: {e}")
+
     st.code("\n".join(smi_preview), language="text")
