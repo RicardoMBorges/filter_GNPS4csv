@@ -217,6 +217,11 @@ The app will keep only spectra whose `SMILES=` exactly matches one of the SMILES
 """
 )
 
+# Load the logo LAABio
+logo_LAABio = Image.open("static/LAABio.png")
+# Display the logo in the sidebar or header
+st.sidebar.image(logo_LAABio, width=300)
+
 with st.sidebar:
     st.header("Inputs")
     mgf_file = st.file_uploader("Upload MGF", type=["mgf", "txt"], accept_multiple_files=False)
@@ -391,3 +396,4 @@ else:
 
     except Exception as e:
         st.error(f"Failed to plot structures: {e}")
+
